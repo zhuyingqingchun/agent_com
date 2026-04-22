@@ -1,0 +1,316 @@
+--- /mnt/data/current_agent.py	2026-04-22 08:28:16.904226578 +0000
++++ /mnt/data/next_agent.py	2026-04-22 08:28:16.905535363 +0000
+@@ -37,12 +37,10 @@
+     """
+     面向赛事提分的 GUI Agent。
+ 
+-    相比基础版本，增加了：
+-    1. 任务级 phase / milestone 状态机；
+-    2. 候选区域化点击与局部裁剪图；
+-    3. app-level playbook memory 写回与检索；
+-    4. 更强的中断/弹窗/卡住页面恢复策略；
+-    5. prompt 中补充更多国内常用生活类 App 先验。
++    本轮继续强化三件事：
++    1. TYPE 前置条件硬约束：未进入输入阶段时禁止直接 TYPE；
++    2. 顶部搜索框 / 左上返回 / 右上小控件更细粒度定位；
++    3. COMPLETE 二段式放行：只有满足完成条件才允许真正结束。
+     """
+ 
+     KNOWN_APPS = [
+@@ -76,8 +74,12 @@
+ 
+     CANDIDATE_REGIONS = {
+         "TOP_BAR": [500, 110],
++        "TOP_SEARCH_BOX": [500, 110],
+         "TOP_LEFT": [180, 110],
++        "TOP_LEFT_ICON": [88, 110],
+         "TOP_RIGHT": [860, 110],
++        "TOP_RIGHT_ICON": [930, 110],
++        "TOP_RIGHT_SMALL": [880, 110],
+         "CENTER_PANEL": [500, 430],
+         "MID_LIST": [500, 560],
+         "LEFT_PANEL": [240, 520],
+@@ -89,6 +91,10 @@
+ 
+     REGION_CROP_RANGES = {
+         "TOP_BAR": (0.00, 0.00, 1.00, 0.22),
++        "TOP_SEARCH_BOX": (0.08, 0.02, 0.92, 0.18),
++        "TOP_LEFT_ICON": (0.00, 0.00, 0.20, 0.18),
++        "TOP_RIGHT_ICON": (0.80, 0.00, 1.00, 0.18),
++        "TOP_RIGHT_SMALL": (0.72, 0.00, 0.96, 0.18),
+         "CENTER_PANEL": (0.08, 0.18, 0.92, 0.72),
+         "MID_LIST": (0.05, 0.22, 0.95, 0.86),
+         "BOTTOM_BAR": (0.00, 0.78, 1.00, 1.00),
+@@ -137,6 +143,9 @@
+             "phase_retry_count": 0,
+             "page_type": "unknown",
+             "last_history_len": 0,
++            "search_box_clicked": False,
++            "complete_ready": False,
++            "submit_ready": False,
+         }
+ 
+     def act(self, input_data: AgentInput) -> AgentOutput:
+@@ -224,6 +233,9 @@
+         self._state["phase_retry_count"] = 0
+         self._state["page_type"] = "unknown"
+         self._state["last_history_len"] = 0
++        self._state["search_box_clicked"] = False
++        self._state["complete_ready"] = False
++        self._state["submit_ready"] = False
+ 
+     def _load_offline_references(self):
+         if not self._dataset_root.exists():
+@@ -426,18 +438,22 @@
+ 你将看到：
+ 1. 当前原始截图
+ 2. 当前带网格截图（全局定位）
+-3. TOP_BAR / CENTER_PANEL / MID_LIST / BOTTOM_BAR / LEFT_PANEL / RIGHT_PANEL 六个局部裁剪图
++3. TOP_SEARCH_BOX / TOP_LEFT_ICON / TOP_RIGHT_ICON / TOP_RIGHT_SMALL / CENTER_PANEL / MID_LIST / RIGHT_PANEL / LEFT_PANEL / BOTTOM_BAR 等局部裁剪图
+ 4. 若有，则附带上一帧原始截图与上一帧网格截图
+ 
+ 候选区域说明（可在 JSON 中额外返回 candidate_region，便于你更稳地指示点击区域）：
+-- TOP_BAR: 顶部搜索栏、标题栏、右上角操作区
++- TOP_SEARCH_BOX: 顶部搜索框 / 输入栏主体
++- TOP_RIGHT_ICON: 顶部右上角小图标、搜索按钮、关闭按钮
++- TOP_RIGHT_SMALL: 顶部更小的次级按钮或筛选控件
++- TOP_LEFT_ICON: 顶部返回、关闭、左上角入口
++- TOP_BAR: 顶部大区域兜底
+ - CENTER_PANEL: 中央主面板
+ - MID_LIST: 中部结果列表 / 内容卡片区
+ - BOTTOM_BAR: 底部导航、底部确认区
+ - LEFT_PANEL / RIGHT_PANEL: 左右侧卡片或按钮区
+ 
+ 动作空间只有：
+-1. CLICK: {{"action":"CLICK","parameters":{{"point":[x,y]}},"candidate_region":"MID_LIST"}}
++1. CLICK: {{"action":"CLICK","parameters":{{"point":[x,y]}},"candidate_region":"TOP_SEARCH_BOX"}}
+ 2. TYPE: {{"action":"TYPE","parameters":{{"text":"要输入的内容"}}}}
+ 3. SCROLL: {{"action":"SCROLL","parameters":{{"start_point":[x1,y1],"end_point":[x2,y2]}}}}
+ 4. OPEN: {{"action":"OPEN","parameters":{{"app_name":"应用名"}}}}
+@@ -450,6 +466,9 @@
+ - 如果出现广告弹窗、权限弹窗、活动弹窗、青少年模式/升级提示等中断页面，优先关闭或跳过，再继续主任务。
+ - 若当前页面和上一帧相似，不要重复同一点位点击或重复无意义输入。
+ - 优先点击当前页面上最明确、最接近目标的 UI 元素，不要跳步。
++- 未点击搜索框或当前 phase 不是 search_input / submit_search 时，禁止直接 TYPE。
++- 当目标是顶部搜索入口、右上角搜索/筛选/关闭按钮时，优先使用 TOP_SEARCH_BOX / TOP_RIGHT_ICON / TOP_RIGHT_SMALL。
++- 只有当结果或答案已经明确显示在当前页，且继续操作大概率会过度点击时，才输出 COMPLETE。
+ - 如果需要输入，优先使用 slots 中的 query/location/destination 等字段，不要凭空编造。
+ - 如果你不确定精确点位，请先用 candidate_region 指定候选区域，再给出该区域内最稳的 point。
+ """.strip()
+@@ -563,7 +582,7 @@
+ 
+         if action == ACTION_CLICK:
+             region_match = re.search(
+-                r"(TOP_BAR|TOP_LEFT|TOP_RIGHT|CENTER_PANEL|MID_LIST|LEFT_PANEL|RIGHT_PANEL|BOTTOM_BAR|BOTTOM_LEFT|BOTTOM_RIGHT)",
++                r"(TOP_SEARCH_BOX|TOP_LEFT_ICON|TOP_RIGHT_ICON|TOP_RIGHT_SMALL|TOP_BAR|TOP_LEFT|TOP_RIGHT|CENTER_PANEL|MID_LIST|LEFT_PANEL|RIGHT_PANEL|BOTTOM_BAR|BOTTOM_LEFT|BOTTOM_RIGHT)",
+                 text.upper(),
+             )
+             numbers = [int(n) for n in re.findall(r"-?\d+", text)]
+@@ -670,23 +689,29 @@
+             text = text.strip()
+             if not text:
+                 text = slots.get("query") or slots.get("destination") or slots.get("keyword") or ""
++            if not self._allow_type_now():
++                self._append_note("当前未进入输入阶段，禁止跳步 TYPE，改为先点击搜索框。")
++                self._state["submit_ready"] = False
++                return ACTION_CLICK, {"point": self._region_center("TOP_SEARCH_BOX")}
++            self._state["submit_ready"] = True
+             self._transition_phase("submit_search")
+             return ACTION_TYPE, {"text": text}
+ 
+         if action == ACTION_COMPLETE:
+-            if input_data.step_count <= 2 or phase in {"launch", "home", "search_entry", "search_input", "submit_search"}:
++            if not self._verify_complete(input_data=input_data, raw_text=raw_text):
+                 fallback_action, fallback_params = self._fallback_action(input_data, page_stuck=page_stuck)
+                 if fallback_action != ACTION_COMPLETE:
+-                    self._append_note("过早 COMPLETE，被改写为推进任务的动作。")
++                    self._append_note("COMPLETE 未通过代码侧校验，改写为继续推进任务的动作。")
+                     return fallback_action, fallback_params
+             self._transition_phase("complete")
++            self._state["complete_ready"] = True
+             return ACTION_COMPLETE, {}
+ 
+         if action == ACTION_CLICK:
+             point = parameters.get("point", [500, 500]) if isinstance(parameters, dict) else [500, 500]
+             region = parameters.get("_candidate_region", "") if isinstance(parameters, dict) else ""
+             point = self._clamp_point(point[0], point[1]) if isinstance(point, list) and len(point) >= 2 else self._region_center(region)
+-            point = self._snap_point_to_region(point, region)
++            point = self._refine_click_point(point=point, region_name=region, page_type=self._state.get("page_type", "unknown"))
+ 
+             if self._looks_like_interrupt_needed(page_stuck=page_stuck, raw_text=raw_text, input_data=input_data):
+                 self._append_note("疑似弹窗/中断页面，优先触发关闭/跳过策略。")
+@@ -696,11 +721,18 @@
+                 self._append_note("连续同点点击无效，启用恢复动作。")
+                 return self._recovery_action(input_data)
+ 
+-            if region == "TOP_BAR":
++            if region in {"TOP_SEARCH_BOX", "TOP_BAR"}:
++                self._state["search_box_clicked"] = True
++                self._state["submit_ready"] = False
+                 self._transition_phase("search_input")
++            elif region in {"TOP_RIGHT_ICON", "TOP_RIGHT_SMALL"}:
++                self._state["submit_ready"] = True
++                self._transition_phase("submit_search")
+             elif region in {"MID_LIST", "CENTER_PANEL", "LEFT_PANEL", "RIGHT_PANEL"} and self._state.get("typed_texts"):
++                self._state["complete_ready"] = True
+                 self._transition_phase("detail")
+             elif region in {"BOTTOM_BAR", "BOTTOM_LEFT", "BOTTOM_RIGHT"}:
++                self._state["complete_ready"] = True
+                 self._transition_phase("confirm")
+             else:
+                 self._transition_phase("results")
+@@ -743,7 +775,7 @@
+             return self._recovery_action(input_data)
+ 
+         if phase in {"home", "search_entry"}:
+-            return ACTION_CLICK, {"point": self._region_center("TOP_BAR")}
++            return ACTION_CLICK, {"point": self._region_center("TOP_SEARCH_BOX")}
+ 
+         if phase in {"search_input", "submit_search"} and slots.get("query") and not self._state.get("typed_texts"):
+             return ACTION_TYPE, {"text": slots["query"]}
+@@ -764,11 +796,11 @@
+ 
+         if phase in {"home", "search_entry"} or (task_type in {"search", "shopping", "video", "food", "hotel", "map"} and not self._state.get("typed_texts")):
+             self._append_note("页面未变化，回退到顶部搜索入口策略。")
+-            return ACTION_CLICK, {"point": self._region_center("TOP_BAR")}
++            return ACTION_CLICK, {"point": self._region_center("TOP_SEARCH_BOX")}
+ 
+         if last_action == ACTION_TYPE:
+             self._append_note("页面未变化，尝试触发输入后的确认/搜索。")
+-            return ACTION_CLICK, {"point": self._region_center("TOP_RIGHT")}
++            return ACTION_CLICK, {"point": self._region_center("TOP_RIGHT_ICON")}
+ 
+         if slots.get("query") and not self._state.get("typed_texts"):
+             self._append_note("页面未变化，改为直接输入任务关键词。")
+@@ -784,7 +816,7 @@
+         retry = self._state.get("phase_retry_count", 0)
+         self._append_note("疑似中断页面，尝试关闭弹窗/跳过。")
+         if retry % 3 == 0:
+-            return ACTION_CLICK, {"point": self._region_center("TOP_RIGHT")}
++            return ACTION_CLICK, {"point": self._region_center("TOP_RIGHT_ICON")}
+         if retry % 3 == 1:
+             return ACTION_CLICK, {"point": self._region_center("TOP_LEFT")}
+         return ACTION_CLICK, {"point": self._region_center("BOTTOM_RIGHT")}
+@@ -801,6 +833,15 @@
+             text = output.parameters.get("text", "")
+             if text and text not in self._state["typed_texts"]:
+                 self._state["typed_texts"].append(text)
++            self._state["submit_ready"] = True
++
++        if action == ACTION_CLICK:
++            point = output.parameters.get("point", [])
++            if isinstance(point, list) and len(point) >= 2:
++                if point[1] <= 180:
++                    self._state["search_box_clicked"] = True
++                if point[1] >= 300:
++                    self._state["complete_ready"] = True
+ 
+         last_action = self._state.get("last_action", "")
+         last_parameters = self._state.get("last_parameters", {})
+@@ -952,24 +993,95 @@
+         last_action = self._state.get("last_action", "")
+         if last_action == ACTION_TYPE:
+             return "search_confirm"
++        if self._state.get("search_box_clicked") and not self._state.get("typed_texts"):
++            return "search_page"
+         if self._state.get("typed_texts"):
+             return "results_or_detail"
+         if phase in {"confirm", "detail"}:
+             return "detail"
+-        if phase in {"search_entry", "search_input"}:
++        if phase in {"search_entry", "search_input", "submit_search"}:
+             return "search_page"
+         return "generic_page"
+ 
++    def _allow_type_now(self) -> bool:
++        phase = self._state.get("phase", "launch")
++        if phase in {"search_input", "submit_search"}:
++            return True
++        if self._state.get("search_box_clicked"):
++            return True
++        last_action = self._state.get("last_action", "")
++        last_point = self._state.get("last_parameters", {}).get("point", [])
++        if last_action == ACTION_CLICK and isinstance(last_point, list) and len(last_point) >= 2 and last_point[1] <= 180:
++            return True
++        return False
++
++    def _verify_complete(self, input_data: AgentInput, raw_text: str) -> bool:
++        phase = self._state.get("phase", "launch")
++        page_type = self._state.get("page_type", "unknown")
++        typed = bool(self._state.get("typed_texts"))
++        retry_count = self._state.get("phase_retry_count", 0)
++        if input_data.step_count < 4:
++            return False
++        if phase in {"launch", "home", "search_entry", "search_input", "submit_search"}:
++            return False
++        if page_type in {"home_or_launcher", "search_page", "search_confirm"}:
++            return False
++        if not (typed or self._state.get("complete_ready") or retry_count >= 1):
++            return False
++        weak_negative = ("搜索框" in raw_text) or ("输入" in raw_text and "已完成" not in raw_text)
++        if weak_negative:
++            return False
++        self._state["complete_ready"] = True
++        return True
++
++    def _region_candidate_points(self, region_name: str) -> List[List[int]]:
++        region_name = (region_name or "").upper().strip()
++        candidates = {
++            "TOP_SEARCH_BOX": [[500, 110], [470, 110], [530, 110], [420, 118], [580, 118]],
++            "TOP_RIGHT_ICON": [[930, 110], [900, 110], [950, 110], [880, 128]],
++            "TOP_RIGHT_SMALL": [[880, 110], [850, 110], [910, 110], [870, 132]],
++            "TOP_LEFT_ICON": [[88, 110], [120, 110], [70, 110], [150, 128]],
++            "TOP_BAR": [[500, 110], [420, 110], [580, 110]],
++            "MID_LIST": [[500, 560], [500, 500], [500, 620], [420, 560], [580, 560]],
++            "RIGHT_PANEL": [[760, 520], [820, 480], [860, 420]],
++            "LEFT_PANEL": [[240, 520], [180, 480], [140, 420]],
++            "BOTTOM_BAR": [[500, 900], [420, 900], [580, 900]],
++            "BOTTOM_RIGHT": [[780, 900], [840, 860], [900, 820]],
++            "BOTTOM_LEFT": [[220, 900], [160, 860], [100, 820]],
++            "CENTER_PANEL": [[500, 430], [500, 500], [500, 360]],
++        }
++        return [self._clamp_point(x, y) for x, y in candidates.get(region_name, [self._region_center(region_name)])]
++
++    def _refine_click_point(self, point: List[int], region_name: str, page_type: str) -> List[int]:
++        region_name = (region_name or "").upper().strip()
++        if region_name not in self.CANDIDATE_REGIONS:
++            return point
++        snapped = self._snap_point_to_region(point, region_name)
++        candidates = self._region_candidate_points(region_name)
++        # 对高频易错小控件，优先候选点，不完全相信模型直接点。
++        if region_name in {"TOP_SEARCH_BOX", "TOP_RIGHT_ICON", "TOP_RIGHT_SMALL", "TOP_LEFT_ICON"}:
++            scored = sorted(
++                candidates,
++                key=lambda p: abs(p[0] - snapped[0]) + abs(p[1] - snapped[1]),
++            )
++            return scored[0]
++        return snapped
++
+     def _transition_phase(self, target_phase: str):
+         old_phase = self._state.get("phase", "launch")
+         if target_phase != old_phase:
+             self._state["phase_retry_count"] = 0
+         self._state["phase"] = target_phase
+         self._state["milestone"] = self.PHASE_TRANSITIONS.get(target_phase, target_phase)
++        if target_phase in {"launch", "home", "search_entry"}:
++            self._state["complete_ready"] = False
++        if target_phase == "search_input":
++            self._state["submit_ready"] = False
++        if target_phase in {"results", "detail", "confirm"}:
++            self._state["complete_ready"] = True
+ 
+     def _looks_like_interrupt_needed(self, page_stuck: bool, raw_text: str, input_data: AgentInput) -> bool:
+         last_repeat = self._state.get("repeat_action_count", 0) >= 1
+-        upper = raw_text.upper()
+         interrupt_tokens = ["关闭", "跳过", "以后再说", "取消", "知道了", "我知道了", "暂不", "不了", "稍后"]
+         hit_text = any(tok in raw_text for tok in interrupt_tokens)
+         return bool(page_stuck and (last_repeat or hit_text or input_data.step_count >= 3 and self._state.get("phase_retry_count", 0) >= 1))
+@@ -998,7 +1110,7 @@
+             if isinstance(point, list) and len(point) >= 2:
+                 x, y = point[:2]
+                 if y <= 180:
+-                    return "顶部区域点击常可打开搜索入口或确认按钮。"
++                    return "顶部区域点击常可打开搜索入口；右上小控件常用于搜索、关闭或确认。"
+                 if y >= 820:
+                     return "底部区域点击常用于确认、切换 Tab 或关闭次级弹窗。"
+                 return "中部列表点击常用于进入结果项或详情页。"
