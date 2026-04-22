@@ -43,33 +43,18 @@ class Agent(BaseAgent):
     3. COMPLETE 二段式放行：只有满足完成条件才允许真正结束。
     """
 
+    # 精简后的应用列表，只保留测试用例中实际使用的应用
     KNOWN_APPS = [
-        "爱奇艺",
-        "百度地图",
-        "哔哩哔哩",
+        "美团",
         "抖音",
+        "百度地图",
+        "爱奇艺",
+        "哔哩哔哩",
         "快手",
         "芒果TV",
-        "美团",
-        "去哪儿旅行",
         "腾讯视频",
         "喜马拉雅",
-        "京东",
-        "拼多多",
-        "大众点评",
-        "铁路12306",
-        "淘宝",
-        "小红书",
-        "携程旅行",
-        "高德地图",
-        "滴滴出行",
-        "饿了么",
-        "支付宝",
-        "微信",
-        "QQ音乐",
-        "网易云音乐",
-        "优酷视频",
-        "盒马",
+        "去哪儿旅行",
     ]
 
     CANDIDATE_REGIONS = {
@@ -160,22 +145,23 @@ class Agent(BaseAgent):
         page_type = self._infer_page_type(input_data, current_rgb)
         self._state["page_type"] = page_type
 
-        offline_entry = self._match_offline_entry(instruction, current_rgb, input_data.step_count)
-        if offline_entry is not None and not page_stuck:
-            action, parameters = self._post_process_action(
-                input_data=input_data,
-                action=offline_entry.action,
-                parameters=offline_entry.parameters,
-                page_stuck=page_stuck,
-                raw_text="offline_entry",
-            )
-            output = AgentOutput(
-                action=action,
-                parameters=parameters,
-                raw_output=f"offline_match={offline_entry.case_name}:{offline_entry.status}",
-            )
-            self._update_runtime_state(current_rgb, current_signature, current_feature, output)
-            return output
+        # 禁用离线匹配，强制使用真实 API (GLM-4V 测试)
+        # offline_entry = self._match_offline_entry(instruction, current_rgb, input_data.step_count)
+        # if offline_entry is not None and not page_stuck:
+        #     action, parameters = self._post_process_action(
+        #         input_data=input_data,
+        #         action=offline_entry.action,
+        #         parameters=offline_entry.parameters,
+        #         page_stuck=page_stuck,
+        #         raw_text="offline_entry",
+        #     )
+        #     output = AgentOutput(
+        #         action=action,
+        #         parameters=parameters,
+        #         raw_output=f"offline_match={offline_entry.case_name}:{offline_entry.status}",
+        #     )
+        #     self._update_runtime_state(current_rgb, current_signature, current_feature, output)
+        #     return output
 
         messages = self._build_messages(input_data, current_rgb, page_stuck)
 

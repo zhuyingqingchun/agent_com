@@ -1,0 +1,719 @@
+--- submission/src/agent.py
++++ submission/src/agent.py
+@@ -37,38 +39,60 @@
+ 
+ class Agent(BaseAgent):
+     """
+-    提分版本 Agent。
+-
+-    目标不是把当前截图当作“单轮问答题”去做，而是：
+-    1. 维护任务级状态（app / task_type / slots / 已输入内容 / 连续失败迹象）；
+-    2. 给模型额外提供网格图和上一帧截图，增强 GUI grounding；
+-    3. 在页面疑似未变化时，禁止重复上一步的无效动作，触发恢复策略。
++    进一步增强的提交版 Agent。
++
++    本轮改进重点：
++    1. 局部裁剪图 + 候选区域化点击，提升点位命中率；
++    2. phase / milestone 硬状态机，减少跳步和过早 COMPLETE；
++    3. app-level playbook memory 写回与检索；
++    4. 独立中断页处理，优先处理弹窗 / 权限 / 广告 / 登录打断。
+     """
+ 
+     KNOWN_APPS = [
+-        "爱奇艺",
+-        "百度地图",
+-        "哔哩哔哩",
+-        "抖音",
+-        "快手",
+-        "芒果TV",
+-        "美团",
+-        "去哪儿旅行",
+-        "腾讯视频",
+-        "喜马拉雅",
+-        "京东",
+-        "拼多多",
+-        "大众点评",
+-        "铁路12306",
+-        "淘宝",
++        "爱奇艺", "百度地图", "哔哩哔哩", "抖音", "快手", "芒果TV", "美团", "去哪儿旅行",
++        "腾讯视频", "喜马拉雅", "京东", "拼多多", "大众点评", "铁路12306", "淘宝",
++        "小红书", "携程旅行", "高德地图", "滴滴出行", "饿了么", "支付宝", "微信",
++        "QQ音乐", "网易云音乐", "优酷视频", "盒马",
+     ]
++
++    REGION_BBOXES: Dict[str, Tuple[int, int, int, int]] = {
++        "TOP_BAR": (0, 0, 1000, 180),
++        "SEARCH_BAR": (80, 40, 920, 180),
++        "TOP_RIGHT": (760, 0, 1000, 180),
++        "CENTER_PANEL": (120, 180, 880, 680),
++        "MID_LIST": (80, 220, 920, 860),
++        "RESULT_LIST": (40, 220, 960, 960),
++        "DETAIL_PANEL": (60, 160, 940, 960),
++        "BOTTOM_BAR": (0, 840, 1000, 1000),
++        "BOTTOM_SHEET": (0, 620, 1000, 1000),
++        "LEFT_PANEL": (0, 180, 420, 960),
++        "RIGHT_PANEL": (580, 180, 1000, 960),
++        "POPUP_CENTER": (180, 220, 820, 780),
++    }
++
++    CROP_SEQUENCE = [
++        "SEARCH_BAR",
++        "CENTER_PANEL",
++        "MID_LIST",
++        "RESULT_LIST",
++        "DETAIL_PANEL",
++        "BOTTOM_BAR",
++        "POPUP_CENTER",
++    ]
++
++    INTERRUPT_TYPES = {
++        "popup", "permission", "ad", "login", "dialog", "update", "system_dialog", "unknown_popup"
++    }
+ 
+     def _initialize(self):
+         self._dataset_root = Path(__file__).resolve().parent / "test_data" / "offline"
+         self._entries_by_signature: Dict[Tuple[str, str], List[ScreenshotEntry]] = {}
+         self._grid_cols = 4
+         self._grid_rows = 6
++        self._memory_path = Path(tempfile.gettempdir()) / "agent_gui_playbook_memory.json"
++        self._latest_parse_meta: Dict[str, Any] = {}
+         self._load_offline_references()
++        self._playbook_memory = self._load_playbook_memory()
+         self.reset()
+ 
+     def reset(self):
+@@ -76,16 +100,26 @@
+             "instruction": "",
+             "app_name": "",
+             "task_type": "generic",
++            "task_candidates": [],
+             "slots": {},
+             "notes": [],
+             "typed_texts": [],
++            "phase": "launch_app",
++            "milestone": "open_target_app",
++            "page_type": "unknown",
++            "interrupt_count": 0,
++            "last_interrupt_type": "",
+             "last_action": "",
+             "last_parameters": {},
+             "repeat_action_count": 0,
+             "screen_signatures": [],
+             "screen_features": [],
+             "last_image": None,
++            "last_candidate_region": "",
++            "phase_retry_count": 0,
++            "playbook_hits": [],
+         }
++        self._latest_parse_meta = {}
+ 
+     def act(self, input_data: AgentInput) -> AgentOutput:
+         instruction = input_data.instruction.strip()
+@@ -148,20 +182,21 @@
+ 
+         app_name = self._extract_app_name(instruction)
+         task_type = self._infer_task_type(instruction, app_name)
++        task_candidates = self._infer_task_candidates(instruction, app_name, task_type)
+         slots = self._extract_slots(instruction, task_type)
+-
++        playbook_hits = self._retrieve_playbook_memory(app_name, task_type)
++
++        self.reset()
+         self._state["instruction"] = instruction
+         self._state["app_name"] = app_name
+         self._state["task_type"] = task_type
++        self._state["task_candidates"] = task_candidates
+         self._state["slots"] = slots
+-        self._state["notes"] = []
+-        self._state["typed_texts"] = []
+-        self._state["last_action"] = ""
+-        self._state["last_parameters"] = {}
+-        self._state["repeat_action_count"] = 0
+-        self._state["screen_signatures"] = []
+-        self._state["screen_features"] = []
+-        self._state["last_image"] = None
++        self._state["phase"] = "launch_app"
++        self._state["milestone"] = "open_target_app"
++        self._state["playbook_hits"] = playbook_hits
++        if playbook_hits:
++            self._append_note("已注入历史 app playbook 经验。")
+ 
+     def _load_offline_references(self):
+         if not self._dataset_root.exists():
+@@ -305,26 +345,31 @@
+             history_lines.append(
+                 f"- step {item.get('step', '?')}: {action} {json.dumps(params, ensure_ascii=False)} valid={valid}"
+             )
+-        history_text = "\\n".join(history_lines) if history_lines else "无"
+-
+-        slots = self._state.get("slots", {})
+-        slots_text = json.dumps(slots, ensure_ascii=False) if slots else "{}"
+-        notes_text = "；".join(self._state.get("notes", [])[-4:]) or "无"
++        history_text = "\n".join(history_lines) if history_lines else "无"
++
++        slots_text = json.dumps(self._state.get("slots", {}), ensure_ascii=False)
++        notes_text = "；".join(self._state.get("notes", [])[-6:]) or "无"
+         typed_texts = self._state.get("typed_texts", [])
+         typed_texts_text = json.dumps(typed_texts[-4:], ensure_ascii=False) if typed_texts else "[]"
+         app_name = self._state.get("app_name", "")
+         task_type = self._state.get("task_type", "generic")
++        phase = self._state.get("phase", "launch_app")
++        milestone = self._state.get("milestone", "open_target_app")
++        page_type = self._state.get("page_type", "unknown")
++        candidates = json.dumps(self._state.get("task_candidates", []), ensure_ascii=False)
+         playbook = self._workflow_hint(app_name, task_type)
++        playbook_hits = self._format_playbook_hits(self._state.get("playbook_hits", []))
++        phase_goal = self._phase_goal_text(phase, milestone)
+         stuck_hint = (
+-            "是。当前页面与上一帧高度相似，禁止机械重复上一步动作。优先寻找新的入口、搜索框、确认按钮或结果列表。"
++            "是。当前页面与上一帧高度相似，禁止机械重复上一步动作。优先换候选区域、换阶段动作、或处理弹窗。"
+             if page_stuck else
+-            "否。仍然优先执行当前页面能直接完成任务的最短动作。"
++            "否。优先执行当前阶段最短且最稳的动作。"
+         )
+ 
+         system_prompt = (
+             "你是一个擅长安卓 GUI 控制的多步 Agent。"
+-            "你必须利用任务记忆、上一帧信息和带网格截图来做更稳的定位。"
+-            "先做页面判断，再输出唯一一个 JSON 对象。"
++            "你必须结合任务阶段、历史动作、上一帧截图、当前全图网格图、局部裁剪图和候选区域，"
++            "先判断页面类型与当前阶段，再输出唯一一个 JSON 对象。"
+         )
+ 
+         user_text = f"""
+@@ -333,24 +378,44 @@
+ 任务摘要：
+ - app_name: {app_name or "未知"}
+ - task_type: {task_type}
++- task_candidates: {candidates}
+ - slots: {slots_text}
++- 当前阶段 phase: {phase}
++- 当前里程碑 milestone: {milestone}
++- 当前估计页面类型 page_type: {page_type}
++- 当前阶段目标: {phase_goal}
+ - 已输入文本: {typed_texts_text}
+ - 历史备注: {notes_text}
+ 
+-当前是第 {input_data.step_count} 步。
+ 最近历史动作：
+ {history_text}
+ 
+ 推荐工作流：
+ {playbook}
+ 
++已检索到的 app playbook memory：
++{playbook_hits}
++
+ 页面疑似未变化：
+ {stuck_hint}
+ 
+-你将看到：
++你会看到：
+ 1. 当前原始截图
+-2. 当前带网格截图（坐标辅助）
+-3. 若有，则附带上一帧原始截图和上一帧带网格截图
++2. 当前带网格截图
++3. 当前若干局部裁剪图（附 region 标签）
++4. 若有，则上一帧原始截图与上一帧网格图
++
++局部裁剪 region 可选值：
++{json.dumps(list(self.CROP_SEQUENCE), ensure_ascii=False)}
++
++点击候选区域 candidate_region 可选值：
++{json.dumps(list(self.REGION_BBOXES.keys()), ensure_ascii=False)}
++
++页面类型 page_type 可选值：
++["app_home","search_entry","search_input","result_list","detail","popup","permission","ad","login","dialog","system","unknown"]
++
++interrupt_type 可选值：
++["popup","permission","ad","login","dialog","update","system_dialog","none"]
+ 
+ 动作空间只有：
+ 1. CLICK: {{"action":"CLICK","parameters":{{"point":[x,y]}}}}
+@@ -359,15 +424,21 @@
+ 4. OPEN: {{"action":"OPEN","parameters":{{"app_name":"应用名"}}}}
+ 5. COMPLETE: {{"action":"COMPLETE","parameters":{{}}}}
+ 
++你可以额外输出这些辅助字段帮助代码二次处理：
++- "page_type": 上述页面类型之一
++- "interrupt_type": 中断类型，若无则输出 "none"
++- "phase": 当前最合适的阶段名
++- "milestone": 当前阶段的小目标
++- "candidate_region": 点击候选区域
++- "crop_point": 针对 candidate_region 的局部相对坐标 [x,y]，范围 0~1000
++
+ 严格要求：
+-- 坐标必须是 0 到 1000 的相对坐标。
+-- 只输出一个 JSON 对象。
+-- 不要输出 markdown，不要输出解释性文字。
+-- 除非任务已经在当前页面明确完成，否则不要输出 COMPLETE。
+-- 若当前页面和上一帧相似，不要重复同一点位点击或重复无意义输入。
+-- 优先点击当前页面上最明确、最接近目标的 UI 元素，不要跳步。
+-- 如果需要输入，尽量使用任务中的核心关键词，不要凭空编造。
+-- 如果你看到搜索框、输入框、筛选项、结果列表，优先利用它们推进任务。
++- 最终只能输出一个 JSON 对象。
++- point / start_point / end_point / crop_point 坐标必须是 0 到 1000 的相对坐标。
++- 若当前处于弹窗、权限、广告、登录页，优先处理中断，不要继续主任务。
++- phase 没有推进到 verify_goal 或 finish 时，不要轻易输出 COMPLETE。
++- 搜索类/生活类任务，优先使用搜索框、输入框、筛选项、结果列表、确认按钮。
++- 页面未变化时，不要重复同一点位点击。
+ """.strip()
+ 
+         current_grid = self._make_grid_image(current_image)
+@@ -396,18 +472,20 @@
+     def _workflow_hint(self, app_name: str, task_type: str) -> str:
+         hints = {
+             "search": "通常流程：进入 App -> 搜索框 -> 输入关键词 -> 进入结果列表 -> 点击最相关结果。",
+-            "hotel": "通常流程：进入 App -> 搜索/酒店频道 -> 输入城市或地点 -> 查看结果列表 -> 进入候选详情页。",
+-            "food": "通常流程：进入 App -> 搜索餐厅/菜品 -> 输入关键词 -> 浏览结果列表 -> 进入目标详情。",
++            "hotel": "通常流程：进入 App -> 酒店频道/搜索 -> 输入城市或地点 -> 结果列表 -> 进入详情页。",
++            "food": "通常流程：进入 App -> 搜索餐厅/菜品 -> 结果列表 -> 进入商家或商品详情。",
+             "video": "通常流程：进入 App -> 搜索入口 -> 输入视频/节目关键词 -> 在结果页点击最相关条目。",
+             "shopping": "通常流程：进入 App -> 搜索框 -> 输入商品关键词 -> 结果页筛选/排序 -> 点击目标商品。",
+             "train": "通常流程：进入 App -> 车票查询 -> 填写出发地/目的地/日期 -> 查询结果。",
+-            "map": "通常流程：进入 App -> 搜索目的地 -> 查看路线/地点详情。",
++            "map": "通常流程：进入 App -> 搜索目的地 -> 查看地点详情/路线。",
++            "music": "通常流程：进入 App -> 搜索歌曲/歌手/专辑 -> 结果页 -> 进入播放页。",
++            "pay": "通常流程：进入 App -> 找目标服务入口 -> 搜索或点击功能项 -> 确认页面。",
+             "generic": "优先找与任务最相关的搜索框、频道入口、列表项、确认按钮。",
+         }
+         app_specific = {
+-            "淘宝": "淘宝常见入口在顶部搜索框、猜你想搜、商品列表卡片。",
+-            "京东": "京东常见入口在顶部搜索框、商品列表卡片、筛选栏。",
+-            "拼多多": "拼多多优先找顶部搜索框和商品列表，不要过早 COMPLETE。",
++            "淘宝": "淘宝优先关注顶部搜索框、商品列表卡片、加入购物车/购买区域。",
++            "京东": "京东优先关注顶部搜索框、商品列表卡片、筛选栏。",
++            "拼多多": "拼多多优先关注顶部搜索框和商品列表，不要过早 COMPLETE。",
+             "抖音": "抖音优先找搜索按钮/放大镜，再进入结果页选择视频。",
+             "哔哩哔哩": "B站优先找搜索入口、综合/视频结果列表。",
+             "美团": "美团优先找酒店/美食入口、搜索框、结果列表。",
+@@ -415,11 +493,48 @@
+             "铁路12306": "12306 优先找出发地、目的地、日期和查询按钮。",
+             "百度地图": "百度地图优先搜索地点，再看路线或地点详情。",
+             "去哪儿旅行": "去哪儿优先搜索酒店/景点/航班等目标频道。",
++            "小红书": "小红书优先找搜索入口、推荐词、笔记/商品卡片。",
++            "携程旅行": "携程优先找酒店/机票/门票频道与搜索框。",
++            "高德地图": "高德优先找搜索框、地点卡片、路线按钮。",
++            "滴滴出行": "滴滴优先找出发地/目的地输入框与车型选择区。",
++            "饿了么": "饿了么优先找搜索框、商家列表、商品卡片。",
++            "支付宝": "支付宝优先找服务搜索框、首页服务入口与确认页。",
++            "微信": "微信优先找顶部搜索、会话列表、服务号或小程序入口。",
++            "QQ音乐": "QQ音乐优先找搜索框、结果列表、播放入口。",
++            "网易云音乐": "网易云优先找搜索入口、结果列表、播放页。",
++            "优酷视频": "优酷优先找搜索框、剧集/视频列表。",
++            "盒马": "盒马优先找搜索框、商品列表、购物车/结算入口。",
+         }
+         return f"{hints.get(task_type, hints['generic'])} {app_specific.get(app_name, '')}".strip()
+ 
++    def _phase_goal_text(self, phase: str, milestone: str) -> str:
++        mapping = {
++            "launch_app": "确保进入目标 App，而不是停留在桌面或其它应用。",
++            "reach_search": "找到最合适的入口：搜索框、频道入口、功能入口。",
++            "fill_query": "把任务核心关键词准确输入到输入框。",
++            "submit_query": "触发搜索/确认，进入结果页或功能页。",
++            "browse_results": "在结果列表中定位最相关候选。",
++            "enter_detail": "进入目标详情页或功能详情页。",
++            "verify_goal": "确认当前页面是否已经满足任务目标。",
++            "finish": "若目标已经明确完成，才允许 COMPLETE。",
++            "handle_interrupt": "优先关闭或处理弹窗、权限、广告、登录打断。",
++        }
++        return f"{mapping.get(phase, '继续推进任务。')} milestone={milestone}"
++
++    def _format_playbook_hits(self, hits: List[Dict[str, Any]]) -> str:
++        if not hits:
++            return "无"
++        lines = []
++        for item in hits[:3]:
++            lines.append(
++                f"- app={item.get('app_name')} task={item.get('task_type')} path={item.get('phases')} "
++                f"successful_regions={item.get('regions')} tips={item.get('tips')}"
++            )
++        return "\n".join(lines)
++
+     def _parse_model_output(self, raw_output: str) -> Tuple[str, Dict[str, Any]]:
+         text = (raw_output or "").strip()
++        self._latest_parse_meta = {}
+         obj = self._extract_json_object(text)
+         if obj is not None:
+             action, parameters = self._extract_action_from_obj(obj)
+@@ -472,7 +611,7 @@
+     @staticmethod
+     def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+         candidates = [text]
+-        match = re.search(r"\\{.*\\}", text, flags=re.S)
++        match = re.search(r"\{.*\}", text, flags=re.S)
+         if match:
+             candidates.append(match.group(0))
+ 
+@@ -490,7 +629,7 @@
+         action = action_match.group(1) if action_match else ACTION_COMPLETE
+ 
+         if action == ACTION_CLICK:
+-            numbers = [int(n) for n in re.findall(r"-?\\d+", text)]
++            numbers = [int(n) for n in re.findall(r"-?\d+", text)]
+             if len(numbers) >= 2:
+                 return ACTION_CLICK, {"point": self._clamp_point(numbers[0], numbers[1])}
+             return ACTION_CLICK, {"point": [500, 500]}
+@@ -505,7 +644,7 @@
+             return ACTION_TYPE, {"text": ""}
+ 
+         if action == ACTION_SCROLL:
+-            numbers = [int(n) for n in re.findall(r"-?\\d+", text)]
++            numbers = [int(n) for n in re.findall(r"-?\d+", text)]
+             if len(numbers) >= 4:
+                 return ACTION_SCROLL, {
+                     "start_point": self._clamp_point(numbers[0], numbers[1]),
+@@ -528,8 +667,17 @@
+         if action == ACTION_CLICK:
+             point = parameters.get("point", [500, 500])
+             if isinstance(point, list) and len(point) >= 2:
+-                return {"point": self._clamp_point(point[0], point[1])}
+-            return {"point": [500, 500]}
++                point = self._clamp_point(point[0], point[1])
++            else:
++                point = [500, 500]
++            result = {"point": point}
++            candidate_region = str(parameters.get("candidate_region", "")).upper().strip()
++            if candidate_region:
++                result["candidate_region"] = candidate_region
++            crop_point = parameters.get("crop_point")
++            if isinstance(crop_point, list) and len(crop_point) >= 2:
++                result["crop_point"] = self._clamp_point(crop_point[0], crop_point[1])
++            return result
+ 
+         if action == ACTION_TYPE:
+             text = parameters.get("text", "")
+@@ -592,22 +750,25 @@
+             return ACTION_TYPE, {"text": text}
+ 
+         if action == ACTION_COMPLETE:
+-            if input_data.step_count <= 2:
++            if not self._allow_complete(input_data):
+                 fallback_action, fallback_params = self._fallback_action(input_data, page_stuck=page_stuck)
+-                if fallback_action != ACTION_COMPLETE:
+-                    self._append_note("过早 COMPLETE，被改写为推进任务的动作。")
+-                    return fallback_action, fallback_params
++                self._append_note("COMPLETE 被双门控阻止，改写为推进任务的动作。")
++                return fallback_action, fallback_params
+             return ACTION_COMPLETE, {}
+ 
+         if action == ACTION_CLICK:
+             point = parameters.get("point", [500, 500]) if isinstance(parameters, dict) else [500, 500]
+             point = self._clamp_point(point[0], point[1])
+ 
+-            if page_stuck and last_action == ACTION_CLICK and last_parameters.get("point") == point:
++            candidate_region = str(parameters.get("candidate_region", "")).upper().strip() if isinstance(parameters, dict) else ""
++            crop_point = parameters.get("crop_point") if isinstance(parameters, dict) else None
++            refined_point = self._refine_click_point(point, candidate_region, crop_point)
++
++            if page_stuck and last_action == ACTION_CLICK and last_parameters.get("point") == refined_point:
+                 self._append_note("连续同点点击无效，启用恢复动作。")
+                 return self._recovery_action(input_data)
+ 
+-            return ACTION_CLICK, {"point": point}
++            return ACTION_CLICK, {"point": refined_point}
+ 
+         if action == ACTION_SCROLL:
+             start = parameters.get("start_point", [500, 800]) if isinstance(parameters, dict) else [500, 800]
+@@ -706,19 +943,66 @@
+         y = max(0, min(1000, y))
+         return [x, y]
+ 
++    def _refine_click_point(
++        self,
++        point: List[int],
++        candidate_region: str,
++        crop_point: Any,
++    ) -> List[int]:
++        candidate_region = candidate_region.upper().strip() if candidate_region else ""
++        if candidate_region not in self.REGION_BBOXES:
++            return point
++
++        x1, y1, x2, y2 = self.REGION_BBOXES[candidate_region]
++
++        if isinstance(crop_point, list) and len(crop_point) >= 2:
++            local = self._clamp_point(crop_point[0], crop_point[1])
++            rx = int(round(x1 + (x2 - x1) * local[0] / 1000.0))
++            ry = int(round(y1 + (y2 - y1) * local[1] / 1000.0))
++            refined = self._clamp_point(rx, ry)
++            self._state["last_candidate_region"] = candidate_region
++            return refined
++
++        px, py = point
++        inside = x1 <= px <= x2 and y1 <= py <= y2
++        if not inside or point == [500, 500]:
++            cx = int(round((x1 + x2) / 2))
++            cy = int(round((y1 + y2) / 2))
++            refined = self._clamp_point(cx, cy)
++            self._state["last_candidate_region"] = candidate_region
++            return refined
++
++        self._state["last_candidate_region"] = candidate_region
++        return point
++
+     def _fallback_action(self, input_data: AgentInput, page_stuck: bool = False) -> Tuple[str, Dict[str, Any]]:
+         slots = self._state.get("slots", {})
+         task_type = self._state.get("task_type", "generic")
+-
+-        if input_data.step_count == 1:
++        phase = self._state.get("phase", "launch_app")
++
++        if input_data.step_count == 1 or phase == "launch_app":
+             app_name = self._state.get("app_name") or self._extract_app_name(input_data.instruction)
+             if app_name:
+                 return ACTION_OPEN, {"app_name": app_name}
+ 
++        if self._is_interrupt_page():
++            return self._interrupt_handler(input_data)
++
++        if phase == "reach_search":
++            return ACTION_CLICK, {"point": [500, 110]}
++        if phase == "fill_query" and slots.get("query"):
++            return ACTION_TYPE, {"text": slots["query"]}
++        if phase == "submit_query":
++            return ACTION_CLICK, {"point": [930, 110]}
++        if phase == "browse_results":
++            return ACTION_CLICK, {"point": [500, 360]}
++        if phase == "enter_detail":
++            return ACTION_CLICK, {"point": [500, 420]}
++
+         if page_stuck:
+             return self._recovery_action(input_data)
+ 
+-        if task_type in {"search", "shopping", "video", "food", "hotel", "map"} and not self._state.get("typed_texts"):
++        if task_type in {"search", "shopping", "video", "food", "hotel", "map", "music", "pay"} and not self._state.get("typed_texts"):
+             return ACTION_CLICK, {"point": [500, 110]}
+ 
+         if task_type == "train" and not self._state.get("typed_texts"):
+@@ -732,22 +1016,62 @@
+     def _recovery_action(self, input_data: AgentInput) -> Tuple[str, Dict[str, Any]]:
+         slots = self._state.get("slots", {})
+         task_type = self._state.get("task_type", "generic")
++        phase = self._state.get("phase", "reach_search")
+         last_action = self._state.get("last_action", "")
++
++        if self._is_interrupt_page():
++            return self._interrupt_handler(input_data)
++
++        if phase == "reach_search":
++            self._append_note("页面未变化，回退到搜索入口策略。")
++            return ACTION_CLICK, {"point": [500, 110]}
++
++        if phase == "fill_query" and slots.get("query") and not self._state.get("typed_texts"):
++            self._append_note("页面未变化，改为直接输入任务关键词。")
++            return ACTION_TYPE, {"text": slots["query"]}
++
++        if phase == "submit_query" or last_action == ACTION_TYPE:
++            self._append_note("页面未变化，尝试触发输入后的确认/搜索。")
++            return ACTION_CLICK, {"point": [930, 110]}
++
++        if phase == "browse_results":
++            self._append_note("页面未变化，改为候选列表区域点击。")
++            return ACTION_CLICK, {"point": [500, 360]}
+ 
+         if task_type in {"search", "shopping", "video", "food", "hotel", "map"} and not self._state.get("typed_texts"):
+             self._append_note("页面未变化，回退到搜索入口策略。")
+             return ACTION_CLICK, {"point": [500, 110]}
+ 
+-        if last_action == ACTION_TYPE:
+-            self._append_note("页面未变化，尝试触发输入后的确认/搜索。")
+-            return ACTION_CLICK, {"point": [930, 110]}
+-
+-        if slots.get("query") and not self._state.get("typed_texts"):
+-            self._append_note("页面未变化，改为直接输入任务关键词。")
+-            return ACTION_TYPE, {"text": slots["query"]}
+-
+         self._append_note("页面未变化，改为滑动探索新的候选区域。")
+         return ACTION_SCROLL, {"start_point": [500, 780], "end_point": [500, 260]}
++
++    def _is_interrupt_page(self) -> bool:
++        page_type = str(self._state.get("page_type", "")).lower()
++        interrupt_type = str(self._state.get("last_interrupt_type", "")).lower()
++        return page_type in self.INTERRUPT_TYPES or interrupt_type in self.INTERRUPT_TYPES
++
++    def _interrupt_handler(self, input_data: AgentInput) -> Tuple[str, Dict[str, Any]]:
++        interrupt_type = str(self._state.get("last_interrupt_type", "")).lower()
++        page_type = str(self._state.get("page_type", "")).lower()
++        current = interrupt_type or page_type
++        self._state["phase"] = "handle_interrupt"
++        self._state["milestone"] = f"resolve_{current or 'interrupt'}"
++        self._state["interrupt_count"] = int(self._state.get("interrupt_count", 0)) + 1
++
++        if current in {"permission", "dialog", "system_dialog", "update"}:
++            self._append_note("检测到权限/系统弹窗，优先处理右下或中右确认按钮。")
++            return ACTION_CLICK, {"point": [760, 720]}
++
++        if current in {"login"}:
++            self._append_note("检测到登录打断，优先关闭登录浮层或返回主流程。")
++            return ACTION_CLICK, {"point": [900, 120]}
++
++        if current in {"popup", "ad", "unknown_popup"}:
++            self._append_note("检测到弹窗/广告，优先尝试右上关闭或中心关闭。")
++            # 优先右上关闭，再失败可靠 page_stuck 触发二次恢复
++            return ACTION_CLICK, {"point": [920, 110]}
++
++        return ACTION_CLICK, {"point": [920, 110]}
+ 
+     def _update_runtime_state(
+         self,
+@@ -757,23 +1081,99 @@
+         output: AgentOutput,
+     ):
+         action = getattr(output, "action", "")
++        params = getattr(output, "parameters", {}) or {}
++
+         if action == ACTION_TYPE:
+-            text = output.parameters.get("text", "")
++            text = params.get("text", "")
+             if text and text not in self._state["typed_texts"]:
+                 self._state["typed_texts"].append(text)
+ 
+         last_action = self._state.get("last_action", "")
+         last_parameters = self._state.get("last_parameters", {})
+-        if action == last_action and output.parameters == last_parameters:
++        if action == last_action and params == last_parameters:
+             self._state["repeat_action_count"] = self._state.get("repeat_action_count", 0) + 1
+         else:
+             self._state["repeat_action_count"] = 0
+ 
++        self._advance_phase(action, params)
++
+         self._state["last_action"] = action
+-        self._state["last_parameters"] = output.parameters
++        self._state["last_parameters"] = params
+         self._state["screen_signatures"] = (self._state["screen_signatures"] + [current_signature])[-6:]
+         self._state["screen_features"] = (self._state["screen_features"] + [current_feature])[-3:]
+         self._state["last_image"] = current_image.copy()
++
++        if action == ACTION_COMPLETE:
++            self._writeback_playbook_memory()
++
++        self._latest_parse_meta = {}
++
++    def _advance_phase(self, action: str, params: Dict[str, Any]):
++        phase = self._state.get("phase", "launch_app")
++        page_type = self._state.get("page_type", "unknown")
++        interrupt = self._is_interrupt_page()
++
++        if interrupt:
++            self._state["phase"] = "handle_interrupt"
++            return
++
++        if phase == "handle_interrupt":
++            if action == ACTION_CLICK:
++                self._state["phase"] = "reach_search"
++                self._state["milestone"] = "recover_main_flow"
++                self._state["last_interrupt_type"] = ""
++            return
++
++        if action == ACTION_OPEN:
++            self._state["phase"] = "reach_search"
++            self._state["milestone"] = "find_search_or_service_entry"
++            return
++
++        if phase == "launch_app":
++            self._state["phase"] = "reach_search"
++            self._state["milestone"] = "find_search_or_service_entry"
++            return
++
++        if phase == "reach_search":
++            if action == ACTION_CLICK:
++                self._state["phase"] = "fill_query"
++                self._state["milestone"] = "input_core_query"
++            elif action == ACTION_TYPE:
++                self._state["phase"] = "submit_query"
++                self._state["milestone"] = "submit_query"
++            return
++
++        if phase == "fill_query":
++            if action == ACTION_TYPE:
++                self._state["phase"] = "submit_query"
++                self._state["milestone"] = "submit_query"
++            return
++
++        if phase == "submit_query":
++            if action in {ACTION_CLICK, ACTION_SCROLL}:
++                self._state["phase"] = "browse_results"
++                self._state["milestone"] = "choose_best_candidate"
++            return
++
++        if phase == "browse_results":
++            if action == ACTION_CLICK:
++                self._state["phase"] = "enter_detail"
++                self._state["milestone"] = "open_candidate_detail"
++            return
++
++        if phase == "enter_detail":
++            if action in {ACTION_CLICK, ACTION_SCROLL}:
++                self._state["phase"] = "verify_goal"
++                self._state["milestone"] = "verify_goal_page"
++            return
++
++        if phase == "verify_goal" and action == ACTION_COMPLETE:
++            self._state["phase"] = "finish"
++            self._state["milestone"] = "done"
++
++        if page_type in {"detail"} and phase not in {"verify_goal", "finish"}:
++            self._state["phase"] = "verify_goal"
++            self._state["milestone"] = "verify_goal_page"
+ 
+     def _infer_task_type(self, instruction: str, app_name: str) -> str:
+         if "酒店" in instruction or "民宿" in instruction:
+@@ -782,19 +1182,44 @@
+             return "food"
+         if "车票" in instruction or "高铁" in instruction or "火车" in instruction or app_name == "铁路12306":
+             return "train"
+-        if "地图" in instruction or "导航" in instruction or "路线" in instruction or app_name == "百度地图":
++        if "地图" in instruction or "导航" in instruction or "路线" in instruction or app_name in {"百度地图", "高德地图"}:
+             return "map"
+-        if "视频" in instruction or "番剧" in instruction or "直播" in instruction or app_name in {"抖音", "哔哩哔哩", "爱奇艺", "腾讯视频", "芒果TV", "快手"}:
++        if "视频" in instruction or "番剧" in instruction or "直播" in instruction or app_name in {"抖音", "哔哩哔哩", "爱奇艺", "腾讯视频", "芒果TV", "快手", "优酷视频"}:
+             return "video"
+-        if "购买" in instruction or "下单" in instruction or "商品" in instruction or app_name in {"淘宝", "京东", "拼多多"}:
++        if "购买" in instruction or "下单" in instruction or "商品" in instruction or app_name in {"淘宝", "京东", "拼多多", "盒马"}:
+             return "shopping"
++        if "歌曲" in instruction or "音乐" in instruction or app_name in {"QQ音乐", "网易云音乐"}:
++            return "music"
++        if app_name in {"支付宝", "微信"}:
++            return "pay"
+         if "搜索" in instruction or "查找" in instruction or "看看" in instruction:
+             return "search"
+         return "generic"
+ 
++    def _infer_task_candidates(self, instruction: str, app_name: str, task_type: str) -> List[str]:
++        candidates = [task_type]
++        if app_name in {"淘宝", "京东", "拼多多", "盒马"}:
++            candidates.append("shopping")
++        if app_name in {"抖音", "哔哩哔哩", "爱奇艺", "腾讯视频", "芒果TV", "快手", "优酷视频"}:
++            candidates.append("video")
++        if app_name in {"百度地图", "高德地图"}:
++            candidates.append("map")
++        if app_name in {"美团", "大众点评", "饿了么", "携程旅行", "去哪儿旅行"}:
++            candidates.append("food")
++            candidates.append("hotel")
++        if app_name in {"铁路12306", "滴滴出行"}:
++            candidates.append("travel")
++        if "支付" in instruction or "服务" in instruction:
++            candidates.append("pay")
++        dedup = []
++        for item in candidates:
++            if item not in dedup:
++                dedup.append(item)
++        return dedup[:4]
++
+     def _extract_slots(self, instruction: str, task_type: str) -> Dict[str, str]:
+         slots: Dict[str, str] = {}
+-        quoted = re.findall(r"[\\\"“](.*?)[\\\"”]", instruction)
++        quoted = re.findall(r'[\\"“](.*?)[\\"”]', instruction)
+         if quoted:
+             slots["query"] = quoted[0].strip()
+ 
+@@ -811,7 +1236,7 @@
+                 if value:
+                     slots[key] = value
+ 
+-        city_match = re.search(r"去([^\\s，。!?]{2,8})", instruction)
++        city_match = re.search(r"去([^\s，。!?]{2,8})", instruction)
+         if city_match and "destination" not in slots:
+             slots["destination"] = city_match.group(1)
+ 

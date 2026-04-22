@@ -1,0 +1,1 @@
+export VLM_API_KEY='60b2acf929e44f9c8bf3d9710a465220.CFHrxV7faSlOUGzi'; export DEBUG_API_URL='https://open.bigmodel.cn/api/paas/v4'; export DEBUG_MODEL_ID='glm-4v-flash'; conda run -n swdtorch12 python test_runner.py --data_dir ./test_data/offline/step_aiqiyi_onekey_0011 --no_debug_test
