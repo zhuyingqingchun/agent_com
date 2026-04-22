@@ -473,22 +473,11 @@ App 经验记忆（若为空则忽略）：
 - 如果你不确定精确点位，请先用 candidate_region 指定候选区域，再给出该区域内最稳的 point。
 """.strip()
 
-        current_grid = self._make_grid_image(current_image)
+        # GLM-4V 限制：只发送当前原始截图，避免超出图片数量限制
         content: List[Dict[str, Any]] = [
             {"type": "text", "text": user_text},
             {"type": "image_url", "image_url": {"url": self._encode_image(current_image)}},
-            {"type": "image_url", "image_url": {"url": self._encode_image(current_grid)}},
         ]
-
-        for region_name, crop_img in self._make_region_crops(current_image).items():
-            content.append({"type": "text", "text": f"当前局部裁剪图：{region_name}"})
-            content.append({"type": "image_url", "image_url": {"url": self._encode_image(crop_img)}})
-
-        last_image = self._state.get("last_image")
-        if isinstance(last_image, Image.Image):
-            content.append({"type": "text", "text": "上一帧原始截图与网格截图如下，可用于判断页面是否真的切换。"})
-            content.append({"type": "image_url", "image_url": {"url": self._encode_image(last_image)}})
-            content.append({"type": "image_url", "image_url": {"url": self._encode_image(self._make_grid_image(last_image))}})
 
         return [
             {"role": "system", "content": system_prompt},
@@ -542,6 +531,19 @@ App 经验记忆（若为空则忽略）：
         return action, parameters
 
     def _extract_action_from_obj(self, obj: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        # 支持 actions 数组格式，提取第一个 action
+        actions = obj.get("actions")
+        if isinstance(actions, list) and len(actions) > 0:
+            first_action = actions[0]
+            if isinstance(first_action, dict):
+                action = str(first_action.get("action", "")).upper().strip()
+                parameters = first_action.get("parameters", {})
+                if action in VALID_ACTIONS and isinstance(parameters, dict):
+                    if "candidate_region" in first_action and isinstance(parameters, dict):
+                        parameters = dict(parameters)
+                        parameters["_candidate_region"] = str(first_action["candidate_region"]).strip().upper()
+                    return action, self._normalize_predicted_params(action, parameters)
+
         action = str(obj.get("action", "")).upper().strip()
         parameters = obj.get("parameters", {})
         if action in VALID_ACTIONS and isinstance(parameters, dict):
