@@ -12,6 +12,7 @@
 - agent_features: 功能开关
 """
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -50,6 +51,73 @@ from utils.agent_rules import (
     workflow_hint,
 )
 from utils.agent_state import make_initial_state, reset_task_state
+
+
+_SOURCE_TAGS = [
+    ("【任务】", "agent_click_prompt.py:get_click_prompt_for_action → 任务指令"),
+    ("【动作】CLICK", "agent_click_prompt.py:get_click_prompt_for_action → 动作类型"),
+    ("【坐标系统", "agent_click_prompt.py:COORDINATE_SYSTEM → 坐标系说明"),
+    ("【点击规则】", "agent_click_prompt.py:get_click_guidance → 点击规则"),
+    ("【当前点击目标】", "agent_click_prompt.py:get_click_guidance → target_element"),
+    ("【方向参考", "agent_click_prompt.py:DIRECTION_HINTS → 阶段方向提示(phase)"),
+    ("【输出要求】", "agent_click_prompt.py:get_click_prompt_for_action → 输出格式"),
+    ("【当前子目标】", "agent.py:_build_click_localizer_messages → get_current_subgoal()"),
+    ("【上一步操作】TYPE", "agent.py:op_context (last_action=TYPE)"),
+    ("【上一步操作】CLICK", "agent.py:op_context (last_action=CLICK+top)"),
+    ("【当前目的】需要点击", "agent.py:op_context → 目的"),
+    ("【目标特征】确认类按钮", "agent.py:op_context → 特征描述"),
+    ("⚠️ 绝对不要点左上角", "agent.py:op_context → 禁止行为"),
+    ("⚠️ 如果主模型判断本步是CLICK", "agent.py:op_context → 重复点击警告"),
+    ("【主模型判断的大致区域】", "agent.py:region_hint (REGION_SEMANTIC)"),
+    ("【主模型粗略方位参考】", "agent.py:coarse_point area_desc"),
+    ("【阶段方向提示】", "agent.py:DIRECTION_HINTS (phase)"),
+    ("仅做点击定位", "agent.py:尾部固定文字"),
+    ("任务:", "agent_prompt.py:get_user_prompt → instruction"),
+    ("应用:", "agent_prompt.py:get_user_prompt → app_name"),
+    ("已输入:", "agent_prompt.py:get_user_prompt → typed_texts"),
+    ("已完成:", "agent_prompt.py:progress_table → workflow_steps"),
+    ("输出JSON:", "agent_prompt.py:get_user_prompt → 尾部"),
+    ("你是安卓 UI 自动化助手", "agent_prompt.py:OptimizedPrompt.get_system_prompt → system"),
+    ("【动作格式】", "agent_prompt.py:OptimizedPrompt → 动作格式定义"),
+    ("【关键词提取】", "agent_prompt.py:OptimizedPrompt → 关键词提取"),
+    ("【标准流程】", "agent_prompt.py:OptimizedPrompt → 标准流程"),
+    ("【工作流步骤】", "agent_prompt.py:progress_table → workflow_steps"),
+    ("【历史动作】", "agent_prompt.py:progress_table → history"),
+    ("【候选区域记忆】", "agent_prompt.py:progress_table → region_memory"),
+    ("【Playbook信息】", "agent_prompt.py:progress_table → playbook_info"),
+    ("【硬性规则】", "agent_prompt.py:system → 硬性规则"),
+    ("【决策顺序】", "agent_prompt.py:system → 决策顺序"),
+    ("你是GUI点击坐标精确定位器", "agent.py:click-localizer system prompt"),
+    ("【坐标规则】", "agent.py:click-localizer system 坐标规则"),
+    ("【命中优先级】", "agent.py:click-localizer system 命中优先级"),
+    ("【禁止行为】", "agent.py:click-localizer system 禁止行为"),
+    ("你是GUI操作工作流规划器", "agent.py:workflow planner system prompt"),
+]
+
+
+def _tag_source(text: str) -> list:
+    if not text or not text.strip():
+        return []
+    lines = text.split("\n")
+    result = []
+    current_block = []
+    current_source = "unknown"
+    for line in lines:
+        matched = False
+        for prefix, source in _SOURCE_TAGS:
+            if line.strip().startswith(prefix[:6]) or line.strip().startswith(prefix[:4]):
+                if current_block:
+                    result.append({"text": "\n".join(current_block).strip(), "source": current_source})
+                    current_block = []
+                current_block.append(line)
+                current_source = source
+                matched = True
+                break
+        if not matched:
+            current_block.append(line)
+    if current_block:
+        result.append({"text": "\n".join(current_block).strip(), "source": current_source})
+    return result if result else [{"text": text.strip(), "source": "unmatched"}]
 
 
 class Agent(BaseAgent):
@@ -113,6 +181,52 @@ class Agent(BaseAgent):
     def reset(self):
         """重置任务状态"""
         self._state = make_initial_state()
+        self._prompt_log_dir = None
+        self._prompt_calls: list = []
+        self._in_click_localizer = False
+
+    def enable_prompt_logging(self, log_dir: str = "./prompt_logs"):
+        os.makedirs(log_dir, exist_ok=True)
+        self._prompt_log_dir = log_dir
+        self._prompt_calls = []
+
+    def _call_api(self, messages, **kwargs):
+        caller = "click_localizer" if self._in_click_localizer else "main_model"
+        if self._prompt_log_dir is not None:
+            self._record_prompt(messages, caller)
+        return super()._call_api(messages, **kwargs)
+
+    def _build_click_localizer_messages(self, *args, **kwargs):
+        self._in_click_localizer = True
+        result = super()._build_click_localizer_messages(*args, **kwargs)
+        self._in_click_localizer = False
+        return result
+
+    def _record_prompt(self, messages, caller: str):
+        import json as _json
+        from datetime import datetime
+        call_idx = len(self._prompt_calls) + 1
+        entry = {"caller": caller, "index": call_idx, "timestamp": datetime.now().isoformat()}
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                entry[role] = content
+                entry[f"{role}_parts"] = _tag_source(content)
+            elif isinstance(content, list):
+                texts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        texts.append(item.get("text", ""))
+                    elif isinstance(item, dict) and item.get("type") == "image_url":
+                        texts.append("[IMAGE]")
+                full_text = "\n".join(texts)
+                entry[role] = full_text
+                entry[f"{role}_parts"] = _tag_source(full_text)
+        self._prompt_calls.append(entry)
+        log_file = os.path.join(self._prompt_log_dir, f"prompts.json")
+        with open(log_file, "w", encoding="utf-8") as f:
+            _json.dump(self._prompt_calls, f, ensure_ascii=False, indent=2)
 
     def act(self, input_data: AgentInput) -> AgentOutput:
         """
