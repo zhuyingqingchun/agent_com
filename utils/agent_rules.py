@@ -129,6 +129,87 @@ def extract_slots(instruction: str, task_type: str) -> Dict[str, str]:
     return slots
 
 
+def decompose_instruction(instruction: str) -> Dict[str, Any]:
+    result = {
+        "app": "",
+        "store_name": "",
+        "product_name": "",
+        "action_type": "",
+        "raw": instruction,
+    }
+    app = extract_app_name(instruction)
+    if app:
+        result["app"] = app
+    store_patterns = [
+        r"([^，,（(]+?\([^)]*店[^)]*\))",
+        r"(?:进入|搜索|去|到)[^，,。]*?([^\s,，。]+?店)",
+        r"([^\s,，（(]{2,20}?[店铺馆楼])",
+    ]
+    for p in store_patterns:
+        m = re.search(p, instruction)
+        if m:
+            result["store_name"] = m.group(1).strip()
+            break
+    product_patterns = [
+        r"(?:店铺的|店的)[^\s,，]*?(.+?)(?:[,，]|地址|默认|选择|$)",
+        r"(?:购买|买[^\s]*?|下单|点[^\s]*?)[\s]*「?([^\s,，。「」]+?)」?(?:[,，]|地址|默认|选择|$)",
+        r"搜索[为找]*([^\s,，。]{2,15})",
+        r"(?:播放|看|搜)([^\s,，。]+(?:视频|番剧|电影|剧集))",
+    ]
+    for p in product_patterns:
+        m = re.search(p, instruction)
+        if m and len(m.group(1).strip()) >= 2:
+            candidate = m.group(1).strip()
+            if candidate != result.get("store_name", ""):
+                result["product_name"] = candidate
+                break
+    if "购买" in instruction or "下单" in instruction or "外卖" in instruction or "点" in instruction:
+        result["action_type"] = "buy"
+    elif "搜索" in instruction or "查找" in instruction:
+        result["action_type"] = "search"
+    elif "播放" in instruction or "看" in instruction:
+        result["action_type"] = "play"
+    elif "导航" in instruction or "路线" in instruction:
+        result["action_type"] = "navigate"
+    return result
+
+
+def get_current_subgoal(instruction: str, state: Dict[str, Any], input_data: Any = None) -> str:
+    parsed = decompose_instruction(instruction)
+    phase = state.get("phase", "launch")
+    typed_texts = state.get("typed_texts", [])
+    step_count = getattr(input_data, "step_count", 0) if input_data else state.get("step_count", 0)
+    app = parsed["app"] or state.get("app_name", "")
+    store = parsed["store_name"]
+    product = parsed["product_name"]
+    action = parsed["action_type"]
+    if phase == "launch":
+        return f"打开{app}" if app else "打开目标应用"
+    if phase in {"home"}:
+        return f"在{app}中找到搜索入口或外卖入口"
+    if phase in {"search_entry", "search_input"}:
+        if store:
+            return f"搜索并进入店铺「{store}」"
+        elif product:
+            return f"搜索「{product}」"
+        return "搜索任务相关内容"
+    if phase == "submit_search":
+        return "点击搜索按钮确认搜索"
+    if phase == "results":
+        if store and not typed_texts:
+            return f"点击搜索结果中的「{store}」进入店铺"
+        return "点击正确的搜索结果项"
+    if phase == "detail":
+        if product and product not in "".join(typed_texts):
+            return f"在店铺内搜索「{product}」"
+        if action == "buy":
+            return "选择商品规格/数量，加入购物车或确认下单"
+        return "执行下一步操作（选择、确认等）"
+    if phase == "confirm":
+        return "确认订单/提交操作（注意地址是否需要选择）"
+    return ""
+
+
 def workflow_hint(app_name: str, task_type: str) -> str:
     return ""
 

@@ -4,6 +4,135 @@ Prompt 工程模块 - 针对 GUI 控制任务优化
 from typing import Dict, List, Any
 
 
+def _summarize_history(history: list, playbook_info: dict = None) -> str:
+    if not history:
+        return ""
+    
+    flow = playbook_info.get("flow", []) if playbook_info else []
+    parts = []
+    
+    for i, item in enumerate(history):
+        action = item.get("action", "?")
+        params = item.get("parameters", {})
+        
+        if flow and i < len(flow):
+            _, desc = flow[i]
+            if action == "TYPE":
+                text = params.get("text", "")
+                if len(text) > 12:
+                    text = text[:12] + ".."
+                parts.append(f"{desc}({text})")
+            elif action == "CLICK" and "激活" in desc:
+                parts.append(f"{desc}(✓已就绪)")
+            elif "确认" in desc or "提交" in desc:
+                parts.append(f"{desc}(✓完成)")
+            else:
+                parts.append(desc)
+        elif action == "OPEN":
+            app = params.get("app_name", "")
+            parts.append(f"已打开{app}")
+        elif action == "TYPE":
+            text = params.get("text", "")
+            if len(text) > 15:
+                text = text[:15] + ".."
+            parts.append(f"已输入: {text}")
+        elif action == "CLICK":
+            point = params.get("point", [])
+            if isinstance(point, list) and len(point) >= 2 and point[1] <= 180:
+                parts.append(f"已点击(✓输入框已就绪)")
+            else:
+                parts.append("已点击")
+        else:
+            parts.append(f"已{action}")
+    
+    return "已完成: " + ", ".join(parts)
+
+
+def _build_progress_table(workflow_steps: list, history: list, playbook_info: dict = None, region_memory: dict = None) -> str:
+    parts = []
+
+    summary = _summarize_history(history, playbook_info)
+    if summary:
+        parts.append(summary)
+
+    if playbook_info:
+        completed = len(history)
+        flow = playbook_info.get("flow", [])
+        tips = playbook_info.get("tips", [])
+        
+        if completed < len(flow):
+            cur_id, cur_desc = flow[completed]
+            
+            prev_desc = ""
+            if completed > 0 and completed - 1 < len(flow):
+                prev_id, prev_raw = flow[completed - 1]
+                prev_desc = _summarize_one_step(prev_id, prev_raw, history, completed - 1)
+            
+            state_hint = _get_state_transition(cur_id, prev_id if completed > 0 else "", prev_desc)
+            parts.append(f"当前: {cur_desc}")
+            if state_hint:
+                parts.append(state_hint)
+        
+        if tips:
+            parts.append("提示: " + "; ".join(tips))
+
+    if region_memory:
+        items = []
+        for region_name, info in region_memory.items():
+            pt = info.get("point", [])
+            if isinstance(pt, list) and len(pt) >= 2:
+                items.append(f"{region_name}≈[{pt[0]},{pt[1]}]")
+        if items:
+            parts.append("已识别: " + ", ".join(items))
+
+    return "\n".join(parts)
+
+
+def _summarize_one_step(step_id: str, raw_desc: str, history: list, idx: int) -> str:
+    if idx < len(history):
+        item = history[idx]
+        params = item.get("parameters", {})
+        if step_id.startswith("input_type"):
+            text = params.get("text", "")
+            return f'已输入"{text[:12]}.."'
+        elif step_id.startswith("input_activate") or "激活" in raw_desc:
+            return "输入框已激活"
+    return ""
+
+
+def _get_state_transition(cur_id: str, prev_id: str, prev_state: str) -> str:
+    transitions = {
+        ("input_type_1", "input_activate_1"): f"{prev_state}，直接TYPE输入内容",
+        ("input_type_2", "input_activate_2"): f"{prev_state}，直接TYPE输入内容",
+        ("input_confirm_1", "input_type_1"): "已输入文本，需点击搜索确认",
+        ("input_confirm_2", "input_type_2"): "已输入商品名，需点击结果确认",
+        ("enter_store", "input_confirm_1"): "已确认搜索，需选择店铺进入",
+        ("select_spec", "input_confirm_2"): "已找到商品，需选择规格",
+        ("checkout", "select_spec"): "已选规格，需去结算",
+    }
+    key = (cur_id, prev_id)
+    return transitions.get(key, "")
+
+
+def _format_params(params: dict) -> str:
+    if not params:
+        return ""
+    if "point" in params:
+        p = params["point"]
+        if isinstance(p, list) and len(p) >= 2:
+            return f"[{p[0]}, {p[1]}]"
+    if "app_name" in params:
+        return f"「{params['app_name']}」"
+    if "text" in params:
+        t = params["text"]
+        if len(t) > 20:
+            t = t[:20] + "..."
+        return f"「{t}」"
+    keys = list(params.keys())[:2]
+    parts = [f"{k}={str(params[k])[:15]}" for k in keys]
+    return ", ".join(parts)
+
+
 class PromptTemplate:
     """Prompt 模板基类"""
 
@@ -194,13 +323,16 @@ TOP_SEARCH_BOX, TOP_RIGHT_ICON, TOP_RIGHT_SMALL, TOP_LEFT_ICON, MID_LIST, CENTER
 【硬性规则】
 1. 只能输出 JSON，不要解释，不要 markdown，不要额外字段。
 2. 坐标必须依据截图中的真实位置，不要机械输出固定坐标。
-3. 没有进入输入框之前，不要直接 TYPE。
-4. 页面上仍然存在明显的“搜索框 / 搜索按钮 / 结果项 / 评论输入框 / 确认按钮”时，不要过早 COMPLETE。
+3. 【手机端输入协议】所有文字输入必须遵循「激活→输入→确认」三步链路：
+   (a) 第一步：点击目标输入框（搜索框/评论框/地址栏/任意可编辑区域）使其获得焦点
+   (b) 第二步：TYPE 输入内容。只有在上一步已经点击过输入框后，才允许 TYPE
+   (c) 第三步：如果页面上出现提交按钮（搜索/发送/确认/下一步），点击它完成确认；如果没有明显按钮或键盘自带完成键，则 TYPE 本身即视为完成
+   违反此顺序的 TYPE 视为无效操作。
+4. 页面上仍然存在明显的"搜索框 / 搜索按钮 / 结果项 / 评论输入框 / 确认按钮"时，不要过早 COMPLETE。
 5. OPEN 只用于任务刚开始、还没打开目标应用时。
 6. 不要输出占位词，例如 "action"、"app"、"text"。
-7. 不要因为任务里有关键词，就直接 TYPE；先确认输入框已经被点开。
-8. 如果页面顶部右侧有明显的小搜索图标/放大镜，优先点它的中心，不要点顶部中间的空白处。
-9. 如果页面底部右侧有明显的搜索入口/放大镜/发现按钮，优先点那个真实按钮。
+7. 每一步只做一件事，不要执行多余或重复的操作。如果上一步已经完成了某个动作（如点击了确认、选择了规格），下一步应该推进到新的操作，而不是重复点同一个位置。
+8. 进入店铺/商品详情页后，如果还需要搜索具体商品（如菜品名），优先在页面顶部找店内搜索框并点击它，而不是点击左侧分类栏或其他区域。
 
 【决策顺序】
 先判断当前是否仍在桌面/启动页，需要 OPEN。
@@ -216,40 +348,28 @@ TOP_SEARCH_BOX, TOP_RIGHT_ICON, TOP_RIGHT_SMALL, TOP_LEFT_ICON, MID_LIST, CENTER
         history: List[Dict[str, Any]],
         workflow_hint: str = "",
         app_memory: str = "",
+        current_subgoal: str = "",
+        workflow_steps: list = None,
+        playbook_info: dict = None,
+        region_memory: dict = None,
     ) -> str:
         phase = state.get("phase", "launch")
         app_name = state.get("app_name", "")
         task_type = state.get("task_type", "generic")
         typed_texts = state.get("typed_texts", [])
 
-        history_lines = []
-        for item in history[-3:]:
-            action = item.get("action", "")
-            params = item.get("parameters", {})
-            history_lines.append(f"- {action} {params}")
-        history_text = "\n".join(history_lines) if history_lines else "- 无"
+        progress_section = _build_progress_table(workflow_steps, history, playbook_info, region_memory)
 
-        return f"""【任务指令】
-{instruction}
+        typed = typed_texts if typed_texts else "-"
+        
+        lines = [f"任务: {instruction}", f"应用: {app_name or '自动判断'}"]
+        if progress_section:
+            lines.append(progress_section)
+        if typed != "-":
+            lines.append(f"已输入: {typed}")
+        lines.append("输出JSON:")
 
-【目标应用】
-{app_name or "从任务中判断"}
-
-【已执行步数】
-{state.get('step_count', '?')}
-
-【最近动作】
-{history_text}
-
-【已输入过的文本】
-{typed_texts if typed_texts else "无"}
-
-【输出偏好】
-- 对 CLICK，尽量同时给出 point 和 candidate_region。
-- candidate_region 只是辅助，不确定时可以不填，但不要填错应用名或占位词。
-- 坐标必须依据截图中的真实位置，不要机械输出固定坐标。
-
-现在只输出下一步动作 JSON：""".strip()
+        return "\n".join(lines)
 
 
 class OptimizedPrompt(PromptTemplate):

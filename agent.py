@@ -129,6 +129,10 @@ class Agent(BaseAgent):
         # 1. 启动任务状态（每一步都提取关键词，支持动态指令）
         self._bootstrap_task_state(instruction, step=input_data.step_count)
         
+        # 1.5 工作流规划（step>1 且尚未规划时，调用模型分解指令为多步子目标）
+        if input_data.step_count > 1 and not self._state.get("workflow_planned"):
+            self._plan_workflow(instruction, input_data)
+        
         # 2. 同步历史记忆
         if self.features.enable_history_sync:
             self._sync_memory_from_history(input_data)
@@ -303,18 +307,39 @@ class Agent(BaseAgent):
         ]
         
         # 获取工作流提示和记忆
+        from utils.agent_rules import workflow_hint, get_current_subgoal
+        from utils.task_playbook import classify_task
+        
         app_name = self._state.get("app_name", "")
         task_type = self._state.get("task_type", "generic")
         playbook = workflow_hint(app_name, task_type)
         memory_hint = retrieve_app_memory(self._app_memory, app_name, task_type) if self.features.enable_app_memory else ""
         
-        # 构建用户消息
+        wf_subgoal = self._get_current_subgoal_from_workflow()
+        current_subgoal = wf_subgoal or get_current_subgoal(input_data.instruction.strip(), self._state, input_data)
+        wf_steps = self._state.get("workflow_steps", [])
+        
+        pb_info = self._state.get("playbook_info")
+        if not pb_info:
+            instruction = input_data.instruction.strip()
+            pb_info = classify_task(instruction, app_name)
+            if pb_info:
+                self._state["playbook_info"] = pb_info
+        
+        last_action = self._state.get("last_action", "")
+        need_region_mem = (last_action != "TYPE" and last_action != "OPEN" and last_action != "COMPLETE")
+        region_mem = self._state.get("region_memory", {}) if need_region_mem else {}
+        
         user_text = prompt_template.get_user_prompt(
             instruction=input_data.instruction.strip(),
             state=self._state,
             history=history,
             workflow_hint=playbook,
             app_memory=memory_hint,
+            current_subgoal=current_subgoal,
+            workflow_steps=wf_steps,
+            playbook_info=pb_info,
+            region_memory=region_mem,
         )
         
         # 构建消息内容
@@ -343,22 +368,86 @@ class Agent(BaseAgent):
     ) -> List[Dict[str, Any]]:
         """为 CLICK 动作构建轻量定位消息。"""
         from utils.agent_click_prompt import ClickPromptHelper
+        from utils.agent_rules import get_current_subgoal
 
         phase = self._state.get("phase", "launch")
         target_description = ClickPromptHelper._infer_target_from_phase(phase, self._state)
         region_hint = coarse_parameters.get("_candidate_region", "")
         coarse_point = coarse_parameters.get("point", [])
 
+        REGION_SEMANTIC = {
+            "TOP_BAR": "屏幕顶部区域（标题栏/导航栏）",
+            "TOP_SEARCH_BOX": "顶部输入框区域",
+            "TOP_LEFT": "屏幕左上角（返回按钮/Logo）",
+            "TOP_LEFT_ICON": "左上角小图标区域",
+            "TOP_RIGHT": "右上角区域",
+            "TOP_RIGHT_ICON": "右上角图标（搜索/更多）",
+            "TOP_RIGHT_SMALL": "右上角小按钮区",
+            "CENTER_PANEL": "屏幕中部主内容区",
+            "MID_LIST": "中部列表区域",
+            "LEFT_PANEL": "左侧面板/侧边栏/分类栏",
+            "RIGHT_PANEL": "右侧面板",
+            "BOTTOM_BAR": "底部操作栏/导航栏",
+            "BOTTOM_LEFT": "底部左侧",
+            "BOTTOM_RIGHT": "底部右侧（确认/提交按钮常在此处）",
+        }
+
         user_text = ClickPromptHelper.get_click_prompt_for_action(
             instruction=input_data.instruction.strip(),
             state=self._state,
             target_element=target_description,
         )
-        if region_hint:
-            user_text += f"\n\n【主模型粗定位参考】\n- candidate_region: {region_hint}"
-        if isinstance(coarse_point, list) and len(coarse_point) >= 2:
-            user_text += f"\n- coarse_point: {coarse_point}"
-        user_text += "\n- 仅做点击定位，不要改动作类型。"
+
+        subgoal = get_current_subgoal(input_data.instruction.strip(), self._state, input_data)
+        if subgoal:
+            user_text += f"\n\n【当前子目标】{subgoal}"
+
+        last_action = self._state.get("last_action", "")
+        last_params = self._state.get("last_parameters", {})
+        typed_texts = self._state.get("typed_texts", [])
+
+        op_context_parts = []
+        if last_action == ACTION_TYPE:
+            typed_content = last_params.get("text", "")
+            if typed_content:
+                display_text = typed_content if len(typed_content) <= 15 else typed_content[:15] + ".."
+                op_context_parts.append(f"【上一步操作】TYPE 输入了内容: 「{display_text}」")
+                op_context_parts.append(f"【当前目的】需要点击确认/提交/发送按钮来完成输入确认（或点击目标操作项）")
+                op_context_parts.append(f"【目标特征】确认类按钮通常在: 输入框右侧、右上角图标区域、或键盘右下角完成键")
+        elif typed_texts and last_action == ACTION_CLICK:
+            last_point = last_params.get("point", [])
+            if isinstance(last_point, list) and len(last_point) >= 2 and last_point[1] <= 220:
+                op_context_parts.append(f"【上一步操作】CLICK 激活了输入框({last_point})")
+                op_context_parts.append(f"【当前目的】输入框已激活，下一步应该TYPE输入内容")
+                op_context_parts.append(f"⚠️ 如果主模型判断本步是CLICK，请确认是否真的需要再点一次（可能应该TYPE）")
+
+        if op_context_parts:
+            user_text += "\n\n" + "\n".join(op_context_parts)
+
+        if region_hint and region_hint in REGION_SEMANTIC:
+            user_text += f"\n\n【主模型判断的大致区域】\n- 方位: {REGION_SEMANTIC[region_hint]}\n- 注意：这只是大致方位，你必须根据截图中实际UI元素的位置确定精确坐标，不要机械地输出固定坐标。"
+        elif isinstance(coarse_point, list) and len(coarse_point) >= 2:
+            x, y = coarse_point
+            area_desc = ""
+            if x < 250:
+                area_desc = "屏幕左半部分"
+            elif x > 750:
+                area_desc = "屏幕右半部分"
+            else:
+                area_desc = "屏幕中部"
+            if y < 200:
+                area_desc += "偏上"
+            elif y > 800:
+                area_desc += "偏下"
+            else:
+                area_desc += "纵向居中"
+            user_text += f"\n\n【主模型粗略方位参考】\n- 大致在: {area_desc}（约 {coarse_point}）\n- 注意：这仅是粗略方位提示，请结合上方操作链上下文和当前子目标，根据截图实际UI位置精确定位。"
+
+        direction_hint = ClickPromptHelper.DIRECTION_HINTS.get(phase, "")
+        if direction_hint:
+            user_text += f"\n\n【阶段方向提示】{direction_hint}"
+
+        user_text += "\n\n仅做点击定位，不要改动作类型。"
 
         content: List[Dict[str, Any]] = [
             {"type": "text", "text": user_text},
@@ -370,7 +459,20 @@ class Agent(BaseAgent):
                 "image_url": {"url": self._encode_image(make_grid_image(current_image, self.features.grid_cols, self.features.grid_rows))}
             })
         return [
-            {"role": "system", "content": "你是点击定位器。只输出一个 CLICK 动作 JSON。"},
+            {"role": "system", "content": (
+                "你是GUI点击坐标精确定位器。根据截图和任务上下文，输出精确的CLICK坐标。\n"
+                "\n【坐标规则】\n"
+                "- 只输出JSON: {\"action\":\"CLICK\",\"parameters\":{\"point\":[x,y]}}\n"
+                "- 坐标[0-1000]，必须对应截图中真实UI元素的中心位置\n"
+                "\n【命中优先级】\n"
+                "1. 先理解当前子目标要点击什么具体控件（确认按钮？提交控件？目标项？）\n"
+                "2. 在截图中找到该控件的精确位置\n"
+                "3. 点击控件中心，不要贴边\n"
+                "\n【禁止行为】\n"
+                "- 上一步如果是TYPE输入文字，这一步绝不点左上角返回按钮\n"
+                "- 不要输出[0,0]、[500,500]等无意义坐标\n"
+                "- 如果主模型给的粗略方位与阶段方向矛盾，以阶段方向为准"
+            )},
             {"role": "user", "content": content},
         ]
 
@@ -408,6 +510,89 @@ class Agent(BaseAgent):
 
         return ACTION_SCROLL, {"start_point": [500, 760], "end_point": [500, 280]}
 
+    def _plan_workflow(self, instruction: str, input_data: AgentInput):
+        """调用模型将指令分解为多步工作流，存入 state 供后续步骤使用。"""
+        import json
+        app_name = self._state.get("app_name", "") or ""
+        
+        wf_prompt = f"""你是一个移动端GUI操作的工作流规划器。请分析以下任务指令，将其分解为完成该任务所需的逐步操作步骤。
+
+【任务指令】
+{instruction}
+
+【目标应用】
+{app_name or "（从指令中判断）"}
+
+【要求】
+1. 将任务拆分为 4-8 个逻辑步骤
+2. 每个步骤用一句话描述当前应该做什么（如"打开输入框"、"输入内容"、"点击确认"等）
+3. 步骤要具体、可执行，不要笼统（不要写"完成任务"，要写具体的UI操作）
+4. 按执行顺序排列
+
+只输出 JSON 数组格式，每个元素是一个步骤描述字符串：
+["步骤1", "步骤2", "步骤3", ...]"""
+
+        messages = [
+            {"role": "system", "content": "你是GUI操作工作流规划器。只输出JSON数组格式的步骤列表。"},
+            {"role": "user", "content": wf_prompt},
+        ]
+        
+        try:
+            response = self._call_api(messages)
+            raw = response.choices[0].message.content or ""
+            
+            steps = json.loads(raw)
+            if isinstance(steps, list) and len(steps) >= 2:
+                self._state["workflow_steps"] = steps
+                self._state["workflow_planned"] = True
+                self._state["workflow_step_index"] = 0
+                notes = self._state.get("notes", [])
+                notes.append(f"工作流规划完成，共{len(steps)}步: {steps}")
+                self._state["notes"] = notes[-20:]
+                print(f"[WORKFLOW] 规划完成: {steps}")
+            else:
+                self._state["workflow_planned"] = True
+                self._state["workflow_steps"] = []
+                print(f"[WORKFLOW] 格式异常: {raw[:100]}")
+        except Exception as e:
+            self._state["workflow_planned"] = True
+            self._state["workflow_steps"] = []
+            print(f"[WORKFLOW] 规划失败: {e}")
+
+    def _get_current_subgoal_from_workflow(self) -> str:
+        """根据已完成的步数和工作流列表，返回当前子目标。"""
+        steps = self._state.get("workflow_steps", [])
+        if not steps:
+            return ""
+        
+        typed_texts = self._state.get("typed_texts", [])
+        phase = self._state.get("phase", "")
+        last_action = self._state.get("last_action", "")
+        
+        idx = 0
+        
+        if phase == "launch":
+            idx = 0
+        elif phase in ("home",):
+            idx = min(1, len(steps) - 1)
+        elif phase in ("search_entry", "search_input"):
+            idx = min(2, len(steps) - 1)
+        elif phase == "submit_search":
+            idx = min(3, len(steps) - 1)
+        elif phase == "results":
+            idx = min(4, len(steps) - 1)
+        elif phase == "detail":
+            if any(t not in "".join(typed_texts) for t in ["排骨", "菜品", "商品"] if t in str(steps)):
+                idx = min(5, len(steps) - 1)
+            else:
+                idx = min(6, len(steps) - 1)
+        elif phase in ("confirm",):
+            idx = min(len(steps) - 1, len(steps) - 1)
+        else:
+            idx = min(len(steps) - 1, max(0, len(typed_texts) + 1))
+        
+        return steps[idx] if idx < len(steps) else ""
+
     def _update_runtime_state(self, current_image: Image.Image, current_signature: str, current_feature, output: AgentOutput):
         """更新运行时状态"""
         from agent_base import ACTION_CLICK, ACTION_TYPE
@@ -421,9 +606,10 @@ class Agent(BaseAgent):
                 self._state["typed_texts"].append(text)
             self._state["submit_ready"] = True
         
-        # 更新 CLICK 状态
+        # 更新 CLICK 状态 + 区域缓存
         if action == ACTION_CLICK:
             point = output.parameters.get("point", [])
+            region = output.parameters.get("_candidate_region", "") or ""
             if isinstance(point, list) and len(point) >= 2:
                 if point[1] <= 180 and point[0] < 800:
                     self._state["search_box_clicked"] = True
@@ -433,6 +619,11 @@ class Agent(BaseAgent):
                     self._state["input_activated"] = False
                 if point[1] >= 300:
                     self._state["complete_ready"] = True
+            
+            region_mem = self._state.get("region_memory", {})
+            if region and point:
+                region_mem[region] = {"point": point, "step": len(action_history)}
+                self._state["region_memory"] = region_mem
         
         # 检测重复动作
         last_action = self._state.get("last_action", "")

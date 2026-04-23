@@ -82,8 +82,8 @@ def snap_point_to_region(point: List[int], region_name: str, candidate_regions: 
     center = region_center(region_name, candidate_regions)
     px, py = point
     cx, cy = center
-    px = int(round((px * 0.6) + (cx * 0.4)))
-    py = int(round((py * 0.6) + (cy * 0.4)))
+    px = int(round((px * 1.0) + (cx * 0.0)))
+    py = int(round((py * 1.0) + (cy * 0.0)))
     return clamp_point(px, py)
 
 

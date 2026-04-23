@@ -111,6 +111,10 @@ class ActionProcessor:
         if override_result is not None:
             return override_result
 
+        override_result = self._apply_left_panel_redirect(point, phase, input_data)
+        if override_result is not None:
+            return override_result
+
         return ACTION_CLICK, {"point": point}
 
     def _process_scroll(self, parameters: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -223,6 +227,105 @@ class ActionProcessor:
 
         center_point = region_center("CENTER_PANEL", self.candidate_regions)
         return ACTION_CLICK, {"point": center_point}
+
+    # ==========================================
+    #   约束1b：detail 阶段左侧栏点击重定向（模型驱动）
+    # ==========================================
+
+    def _apply_left_panel_redirect(
+        self,
+        point: list,
+        phase: str,
+        input_data: Any,
+    ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        if phase != "detail":
+            return None
+        if not self._call_api or not self._current_image:
+            return None
+        x_coord = point[0] if isinstance(point, list) and len(point) >= 2 else 500
+        if x_coord >= 350:
+            return None
+        typed_texts = self.state.get("typed_texts", [])
+        if not typed_texts:
+            return None
+        instruction = getattr(input_data, "instruction", "") or ""
+        remaining_keywords = [w for w in typed_texts if w not in instruction]
+        self._append_note(f"约束1b触发：detail阶段检测到左侧栏点击({point})，调用模型重判。")
+        result = self._call_left_panel_corrector(input_data, point)
+        return result
+
+    def _call_left_panel_corrector(self, input_data: Any, original_point: list) -> Tuple[str, Dict[str, Any]]:
+        import json
+        phase = self.state.get("phase", "unknown")
+        typed_texts = self.state.get("typed_texts", [])
+        instruction = getattr(input_data, "instruction", "") or ""
+        step_count = getattr(input_data, "step_count", 0)
+
+        history_items = getattr(input_data, "history_actions", []) or []
+        history_lines = [
+            f"- step {h.get('step', '?')}: {h.get('action', '')} {json.dumps(h.get('parameters', {}), ensure_ascii=False)}"
+            for h in history_items[-5:]
+        ]
+        history_str = "\n".join(history_lines) if history_lines else "- 无"
+
+        user_prompt = f"""【任务指令】
+{instruction}
+
+【当前阶段】{phase}（已执行 {step_count} 步）
+【已输入过的文本】{typed_texts if typed_texts else '无'}
+
+【历史动作】
+{history_str}
+
+【问题】
+主模型在 {phase} 阶段输出了一个靠近屏幕左侧的 CLICK({original_point})。
+这很可能是点击了左侧分类/导航栏，但在当前任务中这通常不是最优操作。
+
+请仔细观察截图，结合任务指令判断：
+1. 任务是否还需要搜索或输入某段文字？（比如菜品名、商品名等）
+2. 如果需要搜索，优先找页面顶部的搜索框并点击它
+3. 如果可以直接输入文字，输出 TYPE 和具体文本内容
+4. 如果确实需要点击左侧分类，输出合理的 CLICK 坐标
+
+只输出 JSON："""
+
+        content: List[Dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+        if self._current_image is not None:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": self._encode_image(self._current_image)},
+            })
+        if self._include_grid_image and self._make_grid_image:
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": self._encode_image(
+                    self._make_grid_image(self._current_image, self._grid_cols, self._grid_rows))},
+            })
+
+        messages = [
+            {"role": "system", "content": (
+                "你是 GUI 动作校正器。用户的主模型在 detail 阶段给出了一个靠近屏幕左侧的点击坐标。"
+                "你需要判断这是否合理，如果不合理则给出正确的动作。"
+                "只输出 JSON 格式的 action + parameters，不要解释。"
+            )},
+            {"role": "user", "content": content},
+        ]
+
+        try:
+            response = self._call_api(messages)
+            raw_output = response.choices[0].message.content or ""
+            from utils.agent_parser import OutputParser
+            parser = OutputParser(self.candidate_regions)
+            action, params = parser.parse(raw_output)
+            if action in {ACTION_CLICK, ACTION_TYPE, ACTION_SCROLL, ACTION_COMPLETE}:
+                self._append_note(f"约束1b-模型重判结果: {action} {params}")
+                return action, params
+        except Exception as exc:
+            self._append_note(f"约束1b-模型调用失败: {exc}，回退到TYPE。")
+            last_typed = typed_texts[-1] if typed_texts else ""
+            return ACTION_TYPE, {"text": last_typed}
+
+        return ACTION_CLICK, {"point": original_point}
 
     # ==========================================
     #   约束2：confirm 阶段过早 COMPLETE 矫正（模型驱动）
